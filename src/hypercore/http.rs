@@ -57,20 +57,16 @@ use url::Url;
 
 use super::{AssetTarget, signing::*};
 use crate::hypercore::{
-    ActionError, ApiAgent, CandleInterval, Chain, Cloid, Dex, GossipPriorityAuctionStatus, Market,
-    MultiSigConfig, OidOrCloid, OutcomeMeta, PerpMarket, Signature, SpotMarket, SpotToken,
-    api::{
-        Action, ActionRequest, ApproveAgent, ConvertToMultiSigUser, GossipPriorityBid, OkResponse,
-        Response, SignersConfig, UpdateLeverage, VaultTransfer,
-    },
-    mainnet_url, testnet_url,
-    types::{
+    ActionError, ApiAgent, Builder, CandleInterval, Chain, Cloid, Dex, GossipPriorityAuctionStatus, Market, MultiSigConfig, OidOrCloid, OutcomeMeta, PerpMarket, Signature, SpotMarket, SpotToken, api::{
+        Action, ActionRequest, ApproveAgent, ApproveBuilderFee, ConvertToMultiSigUser,
+        GossipPriorityBid, OkResponse, Response, SignersConfig, UpdateLeverage, VaultTransfer,
+    }, mainnet_url, testnet_url, types::{
         AbstractionMode, AgentSendAsset, BasicOrder, BatchCancel, BatchCancelCloid, BatchModify,
         BatchOrder, ClearinghouseState, Fill, FundingRate, InfoRequest, OrderGrouping,
         OrderRequest, OrderResponseStatus, OrderTypePlacement, OrderUpdate, ScheduleCancel,
         SendAsset, SendToken, SpotSend, SubAccount, TimeInForce, UsdSend, UserBalance, UserFees,
         UserRole, UserSetAbstractionAction, UserVaultEquity, VaultDetails,
-    },
+    }
 };
 
 /// HTTP client for HyperCore API.
@@ -1174,6 +1170,7 @@ impl Client {
         nonce: u64,
         vault_address: Option<Address>,
         expires_after: Option<DateTime<Utc>>,
+        builder: Option<Builder>,
     ) -> Result<Vec<OrderResponseStatus>> {
         let batch = BatchOrder {
             orders: vec![OrderRequest {
@@ -1188,6 +1185,7 @@ impl Client {
                 cloid: Default::default(),
             }],
             grouping: OrderGrouping::Na,
+            builder,
         };
 
         self.place(signer, batch, nonce, vault_address, expires_after)
@@ -1359,6 +1357,41 @@ impl Client {
                 anyhow::bail!("approve_agent: {err}")
             }
             _ => anyhow::bail!("approve_agent: unexpected response type: {resp:?}"),
+        }
+    }
+
+    /// Approve the maximum fee rate a builder can charge for routed orders.
+    ///
+    /// # Parameters
+    ///
+    /// - `signer`: The wallet signing the approval
+    /// - `builder`: Builder address in 42-character hexadecimal format
+    /// - `max_fee_rate`: Max fee as percent string (e.g. `"0.001%"`)
+    /// - `nonce`: The nonce for this action
+    pub async fn approve_builder_fee<S: Signer + Send + Sync>(
+        &self,
+        signer: &S,
+        builder: String,
+        max_fee_rate: String,
+        nonce: u64,
+    ) -> Result<()> {
+        let approve_builder_fee = ApproveBuilderFee {
+            signature_chain_id: self.chain.arbitrum_id().to_owned(),
+            hyperliquid_chain: self.chain,
+            max_fee_rate,
+            builder,
+            nonce,
+        };
+
+        let resp = self
+            .sign_and_send(signer, approve_builder_fee, nonce, None, None)
+            .await?;
+        match resp {
+            Response::Ok(OkResponse::Default) => Ok(()),
+            Response::Err(err) => {
+                anyhow::bail!("approve_builder_fee: {err}")
+            }
+            _ => anyhow::bail!("approve_builder_fee: unexpected response type: {resp:?}"),
         }
     }
 
@@ -2321,6 +2354,7 @@ where
     /// let batch = BatchOrder {
     ///     orders: vec![order],
     ///     grouping: OrderGrouping::Na,
+    ///     builder: None,
     /// };
     ///
     /// let statuses = client
@@ -2591,6 +2625,41 @@ where
             Response::Ok(OkResponse::Default) => Ok(()),
             Response::Err(err) => anyhow::bail!("approve_agent: {err}"),
             _ => anyhow::bail!("approve_agent: unexpected response type: {resp:?}"),
+        }
+    }
+
+    /// Approve the maximum fee rate a builder can charge for routed orders.
+    pub async fn approve_builder_fee(&self, builder: String, max_fee_rate: String) -> Result<()> {
+        let chain = self.client.chain;
+
+        let approve_builder_fee = ApproveBuilderFee {
+            signature_chain_id: chain.arbitrum_id().to_owned(),
+            hyperliquid_chain: chain,
+            max_fee_rate,
+            builder,
+            nonce: self.nonce,
+        };
+
+        let action = multisig_collect_signatures(
+            self.lead.address(),
+            self.multi_sig_user,
+            self.signers.iter().copied(),
+            self.signatures.iter().copied(),
+            Action::ApproveBuilderFee(approve_builder_fee),
+            self.nonce,
+            self.client.chain,
+        )
+        .await?;
+
+        let resp = self
+            .client
+            .sign_and_send(self.lead, action, self.nonce, None, None)
+            .await?;
+
+        match resp {
+            Response::Ok(OkResponse::Default) => Ok(()),
+            Response::Err(err) => anyhow::bail!("approve_builder_fee: {err}"),
+            _ => anyhow::bail!("approve_builder_fee: unexpected response type: {resp:?}"),
         }
     }
 

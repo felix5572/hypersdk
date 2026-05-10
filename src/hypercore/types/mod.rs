@@ -91,8 +91,8 @@ pub(super) mod solidity;
 // Re-export important raw types for convenience
 pub use api::AbstractionMode;
 pub use api::{
-    Action, ActionRequest, GossipPriorityBid, MultiSigAction, MultiSigPayload, OkResponse,
-    Response, UserDexAbstractionAction, UserSetAbstractionAction,
+    Action, ActionRequest, ApproveBuilderFee, GossipPriorityBid, MultiSigAction, MultiSigPayload,
+    OkResponse, Response, UserDexAbstractionAction, UserSetAbstractionAction,
 };
 // Import from raw module (which is now a submodule)
 use api::{AgentSendAssetAction, SendAssetAction, SpotSendAction, UsdSendAction};
@@ -2159,6 +2159,7 @@ impl OrderResponseStatus {
 ///         }
 ///     ],
 ///     grouping: OrderGrouping::Na,
+///     builder: None,
 /// };
 /// ```
 ///
@@ -2183,6 +2184,7 @@ impl OrderResponseStatus {
 ///         }
 ///     ],
 ///     grouping: OrderGrouping::PriorityRate(80_000), // 8 bps max
+///     builder: None,
 /// };
 /// ```
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -2190,6 +2192,22 @@ impl OrderResponseStatus {
 pub struct BatchOrder {
     pub orders: Vec<OrderRequest>,
     pub grouping: OrderGrouping,
+    /// Optional builder to receive fees for routed orders.
+    ///
+    /// User must approve a maximum fee first via [`api::ApproveBuilderFee`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builder: Option<Builder>,
+}
+
+/// Builder fee metadata attached to an order action.
+///
+/// Serialized under the `builder` key as `{ "b": <address>, "f": <tenths_of_bps> }`.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Builder {
+    /// Builder address.
+    pub b: String,
+    /// Builder fee in tenths of basis points.
+    pub f: u32,
 }
 
 /// Grouping type for batch orders.
@@ -4359,6 +4377,7 @@ mod tests {
                 cloid: Default::default(),
             }],
             grouping: OrderGrouping::PriorityRate(80_000),
+            builder: None,
         };
 
         let json = serde_json::to_string(&batch).unwrap();

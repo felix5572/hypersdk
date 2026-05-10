@@ -1150,7 +1150,7 @@ impl Client {
     ///
     /// // Market buy 0.01 ETH, accepting fills up to 3500 USDC
     /// let statuses = client
-    ///     .market_open(&signer, eth, true, rust_decimal::dec!(3500), rust_decimal::dec!(0.01), nonce_handler.next(), None, None)
+    ///     .market_open(&signer, eth, true, rust_decimal::dec!(3500), rust_decimal::dec!(0.01), nonce_handler.next(), None, None, None)
     ///     .await?;
     ///
     /// for status in &statuses {

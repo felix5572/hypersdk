@@ -2899,8 +2899,8 @@ pub struct AssetContext {
     #[serde(with = "rust_decimal::serde::str_option", default)]
     pub mid_px: Option<Decimal>,
     /// Premium component of funding
-    #[serde(with = "rust_decimal::serde::str")]
-    pub premium: Decimal,
+    #[serde(with = "rust_decimal::serde::str_option", default)]
+    pub premium: Option<Decimal>,
     /// Previous day closing price
     #[serde(with = "rust_decimal::serde::str")]
     pub prev_day_px: Decimal,

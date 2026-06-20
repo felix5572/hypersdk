@@ -800,7 +800,7 @@ impl PriceTick {
                 RoundingStrategy::ToNegativeInfinity
             }
         };
-        let rounded = price.round_dp_with_strategy(tick.scale(), strategy);
+        let rounded = (price / tick).round_dp_with_strategy(0, strategy) * tick;
         Some(rounded)
     }
 }

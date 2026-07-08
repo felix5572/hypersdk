@@ -2612,6 +2612,11 @@ pub struct CancelByCloid {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleCancel {
+    /// `None` clears the schedule. The field must be *absent* (not `null`) in the
+    /// signed action: Hyperliquid hashes its own serialization without the key, so
+    /// serializing `"time": null` breaks signature recovery ("User or API Wallet
+    /// ... does not exist").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<u64>,
 }
 

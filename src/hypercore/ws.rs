@@ -60,6 +60,7 @@
 //!     coin: "BTC".into(),
 //!     n_sig_figs: None,
 //!     mantissa: None,
+//!     fast: false,
 //! });
 //!
 //! while let Some(event) = ws.next().await {
@@ -355,6 +356,7 @@ pub struct Connection {
 ///         coin: "ETH".into(),
 ///         n_sig_figs: None,
 ///         mantissa: None,
+///         fast: false,
 ///     });
 ///
 ///     // Later, unsubscribe
@@ -465,7 +467,7 @@ impl Connection {
     ///
     /// Subscribe to market data:
     /// - `ws.subscribe(Subscription::Trades { coin: "BTC".into() })`
-    /// - `ws.subscribe(Subscription::L2Book { coin: "ETH".into(), n_sig_figs: None, mantissa: None })`
+    /// - `ws.subscribe(Subscription::L2Book { coin: "ETH".into(), n_sig_figs: None, mantissa: None, fast: false })`
     pub fn subscribe(&self, subscription: Subscription) {
         let _ = self.tx.send((true, subscription));
     }
@@ -534,7 +536,7 @@ impl ConnectionHandle {
     ///
     /// Subscribe to market data:
     /// - `ws.subscribe(Subscription::Trades { coin: "BTC".into() })`
-    /// - `ws.subscribe(Subscription::L2Book { coin: "ETH".into(), n_sig_figs: None, mantissa: None })`
+    /// - `ws.subscribe(Subscription::L2Book { coin: "ETH".into(), n_sig_figs: None, mantissa: None, fast: false })`
     pub fn subscribe(&self, subscription: Subscription) {
         let _ = self.tx.send((true, subscription));
     }
@@ -611,7 +613,8 @@ async fn connection(
             Some(stream) => stream,
             None => {
                 // Exponential backoff: 500ms, 1s, 2s, 4s, 5s (capped)
-                let delay_ms = (INITIAL_RECONNECT_DELAY_MS * (1u64 << reconnect_attempts))
+                // cap reconnect_attempts to 13 (= 8192), otherwise it'll overflow and panic the program
+                let delay_ms = (INITIAL_RECONNECT_DELAY_MS * (1u64 << reconnect_attempts.min(13)))
                     .min(MAX_RECONNECT_DELAY_MS);
                 reconnect_attempts = reconnect_attempts.saturating_add(1);
 

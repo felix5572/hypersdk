@@ -89,6 +89,8 @@
 pub mod error;
 pub mod http;
 pub mod signing;
+#[cfg(test)]
+mod signing_tests;
 pub mod types;
 mod utils;
 pub mod ws;
@@ -202,7 +204,8 @@ pub struct NonceHandler {
 ///
 /// Each [`OutcomeInfo`] produces N order books (one per [`OutcomeSideSpec`]).
 /// The market field stores the Hyperliquid asset index directly:
-/// `100_000_000 + outcome_id * 10 + side_index` where side_index is 0 for "Yes" and 1 otherwise.
+/// `100_000_000 + outcome_id * 10 + side_index`, where side_index is the side's position in
+/// [`OutcomeInfo::side_specs`].
 #[derive(Debug, Clone)]
 pub struct OutcomeMarket {
     /// Outcome metadata
@@ -713,11 +716,25 @@ impl PriceTick {
     /// Example: tick_for() calculates tick size based on price.
     /// See the PriceTick documentation for calculation details.
     pub fn tick_for(&self, price: Decimal) -> Option<Decimal> {
+        // `Decimal::log10` panics on zero and on negatives, and `clamp` panics when
+        // `min > max`, which is what a market whose `sz_decimals` exceeds its decimal
+        // budget produces. Reject both before either is reached: the documented
+        // contract for an invalid price is `None`, not an unwind.
+        if price <= Decimal::ZERO || self.max_decimals < 0 {
+            return None;
+        }
+
         let sig_figs = price.log10();
-        let sig_figs_n = sig_figs.ceil().to_i32()? as i64;
+        // Integer digits = floor(log10(price)) + 1. ceil() and floor+1 agree
+        // except when log10(price) is exact (price a power of ten), where
+        // ceil() undercounts by one and yields a tick ten times too fine.
+        let sig_figs_n = sig_figs.floor().to_i32()? as i64 + 1;
         let decimals = 5_i64 - sig_figs_n;
         let max_decimals = decimals.clamp(0, self.max_decimals);
-        Some(Decimal::TEN.powi(-max_decimals))
+        // `powi` panics with "Pow overflowed" past `Decimal`'s 28-place scale, which a
+        // market claiming more than 28 decimals reaches. `checked_powi` gives the `None`
+        // the contract promises.
+        Decimal::TEN.checked_powi(-max_decimals)
     }
 
     /// Rounds a price to the nearest valid tick.
@@ -842,10 +859,14 @@ pub struct PerpMarket {
     pub isolated_margin: bool,
     /// Margin mode for this market
     pub margin_mode: Option<MarginMode>,
+    /// The deployer fee scale for this market.
+    pub deployer_fee_scale: Option<Decimal>,
     /// Whether growth mode is enabled for this market
     pub growth_mode: bool,
     /// Whether the quote token is aligned for this market
     pub aligned_quote_token: bool,
+    /// Whether this market is delisted
+    pub delisted: bool,
     /// Price tick configuration for valid price increments
     pub table: PriceTick,
 }
@@ -1121,6 +1142,59 @@ mod tick_tests {
     }
 
     #[test]
+    fn invalid_prices_return_none_instead_of_panicking() {
+        // The documented contract is `None` for an invalid price. `Decimal::log10`
+        // panics on both of these, so the guard has to come first.
+        let perp = PriceTick::for_perp(0);
+        assert_eq!(perp.tick_for(Decimal::ZERO), None);
+        assert_eq!(perp.tick_for(dec!(-1)), None);
+        assert_eq!(perp.tick_for(dec!(-0.5)), None);
+        assert_eq!(perp.round(Decimal::ZERO), None);
+        assert_eq!(perp.round(dec!(-1)), None);
+
+        let spot = PriceTick::for_spot(0);
+        assert_eq!(spot.tick_for(Decimal::ZERO), None);
+        assert_eq!(spot.round(dec!(-1)), None);
+    }
+
+    #[test]
+    fn sz_decimals_beyond_the_decimal_budget_return_none() {
+        // 6 - 7 and 8 - 9 are negative, and `clamp(0, negative)` panics.
+        assert_eq!(PriceTick::for_perp(7).tick_for(dec!(100)), None);
+        assert_eq!(PriceTick::for_perp(8).tick_for(dec!(100)), None);
+        assert_eq!(PriceTick::for_spot(9).tick_for(dec!(100)), None);
+        assert_eq!(PriceTick::for_perp(7).round(dec!(100)), None);
+
+        // The boundary itself still works: 6 - 6 and 8 - 8 are zero, a whole-number tick.
+        assert_eq!(PriceTick::for_perp(6).tick_for(dec!(100)), Some(dec!(1)));
+        assert_eq!(PriceTick::for_spot(8).tick_for(dec!(100)), Some(dec!(1)));
+    }
+
+    #[test]
+    fn tick_finer_than_decimal_can_hold_returns_none() {
+        // `Decimal` carries at most 28 decimal places, so a market that claims more
+        // than that overflows `10^-max_decimals`. sz_decimals is negative here, which
+        // is what it takes to push `max_decimals` past 28.
+        let perp = PriceTick::for_perp(-23); // max_decimals = 29
+        assert_eq!(perp.tick_for(Decimal::new(1, 28)), None);
+        assert_eq!(perp.round(Decimal::new(1, 28)), None);
+
+        let spot = PriceTick::for_spot(-21); // max_decimals = 29
+        assert_eq!(spot.tick_for(Decimal::new(1, 28)), None);
+
+        // 28 places is the last one that fits, and it still returns a tick.
+        let widest = PriceTick::for_perp(-22); // max_decimals = 28
+        assert_eq!(
+            widest.tick_for(Decimal::new(1, 28)),
+            Some(Decimal::new(1, 28))
+        );
+
+        // A market this wide only overflows for prices small enough to ask for the
+        // extra places; ordinary prices are unaffected.
+        assert_eq!(perp.tick_for(dec!(100)), Some(dec!(0.01)));
+    }
+
+    #[test]
     fn test_spot() {
         let prices = vec![
             (5, dec!(93231.23), dec!(1), dec!(93231)),
@@ -1152,6 +1226,26 @@ mod tick_tests {
                 price, expected_price, output_price
             );
         }
+    }
+
+    #[test]
+    fn power_of_ten_prices_keep_five_sig_figs() {
+        // Prices that are exact powers of ten exercise the difference
+        // between ceil(log10) and floor(log10) + 1. The latter is the
+        // documented algorithm; the former undercounts the integer digits
+        // by one and yields a tick ten times too fine.
+        let table = PriceTick::for_perp(0); // max_decimals = 6
+        for (price, expected_tick) in [
+            (dec!(1000), dec!(0.1)),
+            (dec!(100), dec!(0.01)),
+            (dec!(10), dec!(0.001)),
+            (dec!(1), dec!(0.0001)),
+        ] {
+            assert_eq!(table.tick_for(price), Some(expected_tick), "{price}");
+        }
+
+        let spot = PriceTick::for_spot(0); // max_decimals = 8
+        assert_eq!(spot.tick_for(dec!(1000)), Some(dec!(0.1)));
     }
 }
 
@@ -1316,7 +1410,8 @@ pub struct OutcomeSideSpec {
 }
 
 /// Outcome market.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(from = "RawOutcomeInfo")]
 pub struct OutcomeInfo {
     /// Outcome ID
     pub outcome: u32,
@@ -1326,6 +1421,13 @@ pub struct OutcomeInfo {
     pub description: String,
     /// The two sides of this outcome
     pub side_specs: Vec<OutcomeSideSpec>,
+    /// Token the outcome is quoted and settled in (e.g., "USDC")
+    pub quote_token: Option<String>,
+    /// Venue of the HIP-4 deployer that listed the outcome (e.g., "out"). `None` for outcomes
+    /// listed without one, such as the daily "Recurring" markets
+    pub venue: Option<String>,
+    /// The deployer fee scale for this outcome, if its deployer set one
+    pub deployer_fee_scale: Option<Decimal>,
 }
 
 /// Groups multiple outcomes into a question.
@@ -1350,6 +1452,66 @@ pub struct OutcomeQuestion {
 pub struct OutcomeMeta {
     pub outcomes: Vec<OutcomeInfo>,
     pub questions: Vec<OutcomeQuestion>,
+}
+
+/// How a HIP-4 outcome settled, from the `settledOutcome` info request.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettledOutcome {
+    /// The outcome as it was listed
+    pub spec: OutcomeInfo,
+    /// Quote tokens paid per share of the first side. The second side receives
+    /// `1 - settle_fraction`
+    pub settle_fraction: Decimal,
+    /// Settlement details from the deployer, such as `price:78212.4`, or `template`
+    pub details: String,
+    /// The question the outcome belongs to, if any
+    pub question: Option<SettledOutcomeQuestion>,
+}
+
+/// The question a [`SettledOutcome`] belongs to.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SettledOutcomeQuestion {
+    /// Question ID, and whether the question has settled
+    pub question: OutcomeQuestionState,
+    /// Question name
+    pub name: String,
+    /// Question description
+    pub description: String,
+}
+
+/// Whether a question has settled, as reported with a [`SettledOutcome`].
+///
+/// The outcomes of a question can settle one at a time, so a settled outcome can belong to a
+/// question that is still active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutcomeQuestionState {
+    /// The question is still open, sent as `{"active": <question>}`
+    Active(u32),
+    /// The question has settled, sent as `{"settled": <question>}`
+    Settled(u32),
+    /// Any other shape, kept as raw JSON so nothing is dropped
+    Other(serde_json::Value),
+}
+
+impl<'de> Deserialize<'de> for OutcomeQuestionState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        // Only an object with exactly one known key and a question ID is a known state.
+        let known = value
+            .as_object()
+            .filter(|map| map.len() == 1)
+            .and_then(|map| {
+                let (state, question) = map.iter().next()?;
+                let question = u32::try_from(question.as_u64()?).ok()?;
+                match state.as_str() {
+                    "active" => Some(Self::Active(question)),
+                    "settled" => Some(Self::Settled(question)),
+                    _ => None,
+                }
+            });
+        Ok(known.unwrap_or(Self::Other(value)))
+    }
 }
 
 impl PartialEq for OutcomeInfo {
@@ -1596,7 +1758,6 @@ pub async fn perp_dexes(
             dex.map(|dex| Dex {
                 name: dex.name,
                 index,
-                deployer_fee_scale: dex.deployer_fee_scale,
             })
         })
         .collect();
@@ -1617,8 +1778,6 @@ pub async fn perp_dexs(
 #[serde(rename_all = "camelCase")]
 struct PerpDex {
     name: String,
-    #[serde(default, with = "rust_decimal::serde::str_option")]
-    deployer_fee_scale: Option<Decimal>,
 }
 
 /// Fetches all available perpetual futures markets from HyperCore.
@@ -1665,8 +1824,10 @@ pub async fn perp_markets(
                 collateral: collateral.clone(),
                 isolated_margin: perp.only_isolated,
                 margin_mode: perp.margin_mode,
+                deployer_fee_scale: perp.deployer_fee_scale,
                 growth_mode: perp.growth_mode,
                 aligned_quote_token: perp.aligned_quote_token,
+                delisted: perp.delisted,
                 table: PriceTick::for_perp(perp.sz_decimals),
             }
         })
@@ -1693,20 +1854,7 @@ pub async fn outcome_meta(
     let raw: RawOutcomeMeta = resp.json().await?;
 
     Ok(OutcomeMeta {
-        outcomes: raw
-            .outcomes
-            .into_iter()
-            .map(|o| OutcomeInfo {
-                outcome: o.outcome,
-                name: o.name,
-                description: o.description,
-                side_specs: o
-                    .side_specs
-                    .into_iter()
-                    .map(|s| OutcomeSideSpec { name: s.name })
-                    .collect(),
-            })
-            .collect(),
+        outcomes: raw.outcomes.into_iter().map(OutcomeInfo::from).collect(),
         questions: raw
             .questions
             .into_iter()
@@ -1724,19 +1872,25 @@ pub async fn outcome_meta(
 
 /// Fetch all outcome markets, returning one [`OutcomeMarket`] per side.
 ///
-/// The market index is calculated as `outcome * 10 + side_index` where
-/// "Yes" gets side index 0 and all other sides get 1.
+/// The market index is `100_000_000 + outcome * 10 + side_index`, where `side_index` is the
+/// side's position in [`OutcomeInfo::side_specs`].
 pub async fn outcomes(
     core_url: impl IntoUrl,
     client: reqwest::Client,
 ) -> anyhow::Result<Vec<OutcomeMarket>> {
     let meta = outcome_meta(core_url, client).await?;
+    Ok(outcome_markets(&meta))
+}
 
+/// Returns one [`OutcomeMarket`] per side of every outcome in `meta`.
+///
+/// Sides are indexed by position, not by name: template outcomes name their sides
+/// `template:Yes` and `template:No`, or after the participants.
+fn outcome_markets(meta: &OutcomeMeta) -> Vec<OutcomeMarket> {
     let mut result = Vec::new();
     for o in &meta.outcomes {
-        for side in &o.side_specs {
-            let is_yes = side.name == "Yes";
-            let market = 100_000_000 + (o.outcome as usize) * 10 + usize::from(!is_yes);
+        for (side_index, side) in o.side_specs.iter().enumerate() {
+            let market = 100_000_000 + (o.outcome as usize) * 10 + side_index;
             result.push(OutcomeMarket {
                 info: o.clone(),
                 side: side.name.clone(),
@@ -1745,7 +1899,7 @@ pub async fn outcomes(
         }
     }
 
-    Ok(result)
+    result
 }
 
 #[derive(Deserialize)]
@@ -1764,6 +1918,28 @@ struct RawOutcomeInfo {
     name: String,
     description: String,
     side_specs: Vec<RawOutcomeSideSpec>,
+    quote_token: Option<String>,
+    venue: Option<String>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    deployer_fee_scale: Option<Decimal>,
+}
+
+impl From<RawOutcomeInfo> for OutcomeInfo {
+    fn from(raw: RawOutcomeInfo) -> Self {
+        Self {
+            outcome: raw.outcome,
+            name: raw.name,
+            description: raw.description,
+            side_specs: raw
+                .side_specs
+                .into_iter()
+                .map(|s| OutcomeSideSpec { name: s.name })
+                .collect(),
+            quote_token: raw.quote_token,
+            venue: raw.venue,
+            deployer_fee_scale: raw.deployer_fee_scale,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1814,10 +1990,14 @@ struct PerpUniverseItem {
     only_isolated: bool,
     margin_mode: Option<MarginMode>,
     sz_decimals: i64,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    deployer_fee_scale: Option<Decimal>,
     #[serde(default, deserialize_with = "deserialize_growth_mode")]
     growth_mode: bool,
     #[serde(default, alias = "isAlignedQuoteToken", alias = "isQuoteTokenAligned")]
     aligned_quote_token: bool,
+    #[serde(default, alias = "isDelisted")]
+    delisted: bool,
     // margin_table_id: u64,
 }
 
@@ -1926,7 +2106,11 @@ struct EvmContract {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc, thread};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+        thread,
+    };
 
     use alloy::primitives::address;
 
@@ -2014,6 +2198,53 @@ mod tests {
         let _fees = client.user_fees(user).await.unwrap();
     }
 
+    /// The undocumented info requests whose responses this SDK models rather than returning
+    /// as raw JSON. A shape change here is a deserialization failure, which the
+    /// `info_requests_are_still_answered` audit cannot see: it parses everything as
+    /// `serde_json::Value`.
+    #[tokio::test]
+    async fn test_http_undocumented_typed_responses() {
+        let client = hypercore::mainnet();
+        let user = address!("0xdfc24b077bc1425ad1dea75bcb6f8158e10df303");
+
+        let status = client.exchange_status().await.unwrap();
+        assert!(status.time > 0);
+
+        let _legal = client.legal_check(user).await.unwrap();
+        let _routing = client.usdc_routing().await.unwrap();
+        let _check = client.pre_transfer_check(user, user).await.unwrap();
+        let _vip = client.is_vip(user).await.unwrap();
+
+        let table = client.margin_table(50).await.unwrap();
+        assert!(!table.margin_tiers.is_empty());
+
+        let ntls = client.max_market_order_ntls().await.unwrap();
+        assert!(!ntls.is_empty());
+
+        let trades = client.recent_trades("BTC".to_string()).await.unwrap();
+        assert!(!trades.is_empty());
+
+        let ips = client.gossip_root_ips().await.unwrap();
+        assert!(!ips.is_empty());
+
+        let fundings = client.predicted_fundings().await.unwrap();
+        assert!(!fundings.is_empty());
+        // A coin absent from a venue comes back as null, which is why the venue payload is
+        // optional. Asserting one is present keeps the Option from being reverted.
+        assert!(
+            fundings
+                .iter()
+                .any(|(_, venues)| venues.iter().any(|(_, predicted)| predicted.is_none()))
+        );
+
+        // Outcome 9 is a named outcome of an early BTC price-bucket question, settled at 0.
+        let settled = client.settled_outcome(9).await.unwrap().unwrap();
+        assert_eq!(settled.spec.outcome, 9);
+        assert!(settled.question.is_some());
+        // An outcome that has not settled, or does not exist, comes back as null.
+        assert!(client.settled_outcome(999_999_999).await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn test_http_all_mids() {
         let client = hypercore::mainnet();
@@ -2045,12 +2276,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_http_perp_dex_details() {
+        for client in [hypercore::mainnet(), hypercore::testnet()] {
+            let details = client.perp_dex_details().await.unwrap();
+            let dexes = client.perp_dexes().await.unwrap();
+            assert!(!details.is_empty());
+
+            // HIP-3 asset IDs are derived from the index, so both methods must agree on it.
+            assert_eq!(details.len(), dexes.len());
+            for (detail, dex) in details.iter().zip(&dexes) {
+                assert_eq!(
+                    (detail.name.as_str(), detail.index),
+                    (dex.name(), dex.index())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_user_star_state() {
+        let client = hypercore::testnet();
+
+        // A user no venue has approved gets an empty list.
+        let none = client.user_star_state(Address::ZERO).await.unwrap();
+        assert!(none.dex_to_state.is_empty());
+
+        // Traders on HIP-3* venues have non-empty states, which exercises the flags shape.
+        let star_dexes = client
+            .perp_dex_details()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|dex| {
+                dex.sub_deployers.iter().any(|grant| {
+                    matches!(
+                        grant.permission,
+                        hypercore::SubDeployerPermission::Hip3Star { .. }
+                    )
+                })
+            });
+        for dex in star_dexes {
+            for market in client
+                .perps_from(dex.dex())
+                .await
+                .unwrap()
+                .into_iter()
+                .take(2)
+            {
+                for trade in client
+                    .recent_trades(market.name)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .take(3)
+                {
+                    for user in trade.users {
+                        client.user_star_state(user).await.unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_http_spot() {
         let client = hypercore::mainnet();
         let spots = client.spot().await.unwrap();
 
         // Should have spot markets
         assert!(!spots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_http_delisted_markets() {
+        let exp = [
+            (0, "BTC", false),
+            (1, "ETH", false),
+            (3, "MATIC", true),
+            (5, "SOL", false),
+            (30, "MKR", true),
+            (66, "TON", true),
+        ];
+
+        let client = hypercore::mainnet();
+        let perps = client.perps().await.unwrap();
+
+        for (index, name, delisted) in exp {
+            let market = perps.get(index).unwrap();
+            assert_eq!(market.index, index);
+            assert_eq!(market.name, name);
+            assert_eq!(market.delisted, delisted);
+        }
     }
 
     #[test]
@@ -2179,6 +2495,18 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_http_outcome_markets_are_distinct() {
+        for client in [hypercore::mainnet(), hypercore::testnet()] {
+            let markets = client.outcomes().await.unwrap();
+            assert!(!markets.is_empty());
+            // Every side of every outcome is its own asset. Template outcomes name their sides
+            // "template:Yes" and "template:No", which a match on "Yes" gave the same index.
+            let unique: HashSet<usize> = markets.iter().map(|m| m.market).collect();
+            assert_eq!(unique.len(), markets.len());
+        }
+    }
+
     #[test]
     fn outcome_meta_deserialize() {
         let json = r#"{
@@ -2226,5 +2554,172 @@ mod tests {
         let meta: RawOutcomeMeta = serde_json::from_str(json).unwrap();
         assert!(meta.outcomes.is_empty());
         assert!(meta.questions.is_empty());
+    }
+
+    #[test]
+    fn outcome_info_deserialize_venue_fields() {
+        // A deployer-listed outcome, and one of the daily "Recurring" markets, which have no
+        // venue or deployer fee scale, as mainnet sends them.
+        let json = r#"[
+            {
+                "outcome": 1472,
+                "name": "template fallback",
+                "description": "other",
+                "sideSpecs": [{"name": "Yes"}, {"name": "No"}],
+                "quoteToken": "USDC",
+                "venue": "out",
+                "deployerFeeScale": "1.0"
+            },
+            {
+                "outcome": 3,
+                "name": "Recurring",
+                "description": "class:priceBinary|underlying:BTC|expiry:20260506-0600|targetPrice:80930|period:1d",
+                "sideSpecs": [{"name": "Yes"}, {"name": "No"}],
+                "quoteToken": "USDH"
+            }
+        ]"#;
+        let outcomes: Vec<OutcomeInfo> = serde_json::from_str(json).unwrap();
+        assert_eq!(outcomes[0].quote_token.as_deref(), Some("USDC"));
+        assert_eq!(outcomes[0].venue.as_deref(), Some("out"));
+        assert_eq!(outcomes[0].deployer_fee_scale, Some(Decimal::ONE));
+        assert_eq!(outcomes[1].quote_token.as_deref(), Some("USDH"));
+        assert_eq!(outcomes[1].venue, None);
+        assert_eq!(outcomes[1].deployer_fee_scale, None);
+    }
+
+    #[test]
+    fn outcome_markets_index_sides_by_position() {
+        // Template outcomes do not name their first side "Yes". Matching on the name gave both
+        // sides of these outcomes the second side's asset index.
+        let json = r#"[
+            {
+                "outcome": 1472,
+                "name": "template fallback",
+                "description": "other",
+                "sideSpecs": [{"name": "Yes"}, {"name": "No"}]
+            },
+            {
+                "outcome": 8591,
+                "name": "template:binaryPrice",
+                "description": "perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:85734|time:20261005-0600",
+                "sideSpecs": [{"name": "template:Yes"}, {"name": "template:No"}]
+            },
+            {
+                "outcome": 6733,
+                "name": "template:sportsContestWinner",
+                "description": "shortNameA:Buccaneers|shortNameB:Cowboys",
+                "sideSpecs": [{"name": "template:{shortNameA}"}, {"name": "template:{shortNameB}"}]
+            }
+        ]"#;
+        let meta = OutcomeMeta {
+            outcomes: serde_json::from_str(json).unwrap(),
+            questions: vec![],
+        };
+
+        let markets: Vec<(String, usize, String)> = outcome_markets(&meta)
+            .iter()
+            .map(|m| (m.side.clone(), m.market, m.coin()))
+            .collect();
+        assert_eq!(
+            markets,
+            [
+                ("Yes", 100_014_720, "#14720"),
+                ("No", 100_014_721, "#14721"),
+                ("template:Yes", 100_085_910, "#85910"),
+                ("template:No", 100_085_911, "#85911"),
+                ("template:{shortNameA}", 100_067_330, "#67330"),
+                ("template:{shortNameB}", 100_067_331, "#67331"),
+            ]
+            .map(|(side, market, coin)| (side.to_string(), market, coin.to_string()))
+        );
+    }
+
+    #[test]
+    fn settled_outcome_deserialize() {
+        // A standalone outcome, a named outcome of a settled question, and a named outcome of a
+        // question that is still active, as mainnet and testnet send them.
+        let standalone: SettledOutcome = serde_json::from_str(
+            r#"{
+                "spec": {
+                    "outcome": 3,
+                    "name": "Recurring",
+                    "description": "class:priceBinary|underlying:BTC|expiry:20260506-0600|targetPrice:80930|period:1d",
+                    "sideSpecs": [{"name": "Yes"}, {"name": "No"}],
+                    "quoteToken": "USDH"
+                },
+                "settleFraction": "1.0",
+                "details": "price:81290.9"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(standalone.spec.outcome, 3);
+        assert_eq!(standalone.spec.quote_token.as_deref(), Some("USDH"));
+        assert_eq!(standalone.settle_fraction, Decimal::ONE);
+        assert_eq!(standalone.details, "price:81290.9");
+        assert!(standalone.question.is_none());
+
+        let named: SettledOutcome = serde_json::from_str(
+            r#"{
+                "spec": {
+                    "outcome": 9,
+                    "name": "Recurring Named Outcome",
+                    "description": "index:2",
+                    "sideSpecs": [{"name": "Yes"}, {"name": "No"}],
+                    "quoteToken": "USDH"
+                },
+                "settleFraction": "0.0",
+                "details": "price:79580.2",
+                "question": {
+                    "question": {"settled": 0},
+                    "name": "Recurring",
+                    "description": "class:priceBucket|underlying:BTC|expiry:20260508-0600|priceThresholds:79303,82540|period:1d"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(named.settle_fraction, Decimal::ZERO);
+        let question = named.question.unwrap();
+        assert_eq!(question.question, OutcomeQuestionState::Settled(0));
+        assert_eq!(question.name, "Recurring");
+
+        let active: SettledOutcome = serde_json::from_str(
+            r#"{
+                "spec": {
+                    "outcome": 12568,
+                    "name": "template:sportsContestParticipant",
+                    "description": "participant:Arsenal",
+                    "sideSpecs": [{"name": "Yes"}, {"name": "No"}],
+                    "quoteToken": "USDC",
+                    "venue": "mig",
+                    "deployerFeeScale": "1.0"
+                },
+                "settleFraction": "0.0",
+                "details": "template",
+                "question": {
+                    "question": {"active": 979},
+                    "name": "template:sportsContestResult",
+                    "description": "participantA:Arsenal|participantB:Chelsea"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(active.spec.venue.as_deref(), Some("mig"));
+        assert_eq!(
+            active.question.unwrap().question,
+            OutcomeQuestionState::Active(979)
+        );
+
+        // The exchange answers null for an outcome that has not settled.
+        let unsettled: Option<SettledOutcome> = serde_json::from_str("null").unwrap();
+        assert!(unsettled.is_none());
+    }
+
+    #[test]
+    fn outcome_question_state_keeps_unknown_shapes() {
+        let state: OutcomeQuestionState = serde_json::from_str(r#"{"paused": 5}"#).unwrap();
+        assert_eq!(
+            state,
+            OutcomeQuestionState::Other(serde_json::json!({"paused": 5}))
+        );
     }
 }

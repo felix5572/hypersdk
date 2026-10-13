@@ -1,15 +1,177 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+Notable changes to hypersdk and the bundled hypecli, grouped by SDK release tag.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Updated hypecli's SDK dependency requirement to 0.3.0 so release builds resolve the local SDK.
+
+## [v0.3.0] - 2026-10-12
+
 ### Added
 
-- `BasicOrder` trigger-order fields from `frontendOpenOrders`: `is_trigger`, `trigger_px`, `trigger_condition`, `is_position_tpsl`
-- `OrderResponseStatus::WaitingForTrigger` and `WaitingForFill` order response variants
+- Native trailing stops through `HttpClient::trailing_stop`, `Action::TrailingStop`, and `TrailingStopRetracement`, with percentage or price-distance retracement and an optional activation price.
+- HIP-3* support for testnet venues: `Hip3StarAction`, oracle updates, proxied user operations, `PerpDexSchemaInput::is_star`, and `HttpClient::user_star_state`.
+- `hypecli dex` commands for DEX details, halting and resuming markets, sub-deployer permissions, and HIP-3* account approvals and operations.
+- Top-level `hypecli to-normal-user` command for converting a multisig account back to a normal account.
+- Typed outcome settlement responses: `SettledOutcome`, `SettledOutcomeQuestion`, and `OutcomeQuestionState`.
+- `OutcomeInfo::quote_token`, `venue`, and `deployer_fee_scale`, plus `Deserialize` support.
+
+### Changed
+
+- **Breaking**: `UpdateIsolatedMargin::ntli` and the corresponding `HttpClient::update_isolated_margin` argument are now `i64`. Negative values remove isolated margin.
+- **Breaking**: HIP-4 deployment and settlement use `OutcomeDeploy { venue, operation }`. Pass this wrapper to `Action::OutcomeDeploy` or `HttpClient::outcome_deploy`.
+- **Breaking**: `HttpClient::settled_outcome` returns `Option<SettledOutcome>` instead of raw JSON. `None` means the outcome has not settled or the ID is unknown.
+- **Breaking**: `SubDeployerInput::variant` uses `SubDeployerPermission` instead of `String`, allowing HIP-3* grants. Existing string permissions can use `.into()`.
+- **Breaking**: `PerpDexSchemaInput` struct literals need `is_star: false` for ordinary venues; `OutcomeInfo` literals need the new metadata fields.
+
+### Fixed
+
+- Outcome sides are indexed by their position in `side_specs`, so template and participant-named markets receive the correct asset IDs.
+- `twap_order` and `twap_cancel` parse successful replies as `OkResponse::TwapOrder` and `OkResponse::TwapCancel`.
+- Order history accepts trailing stops, liquidation orders, vault-close orders, TWAP slices, spot dust conversions, and outcome-settlement cancellations. New order statuses are included in `is_cancelled` and `is_rejected`.
+- HIP-4 actions include the deployer's venue and nest the operation correctly, fixing rejected deployment and settlement requests.
+
+## [v0.2.18] - 2026-09-28
+
+### Added
+
+- `HttpClient::perp_dex_details` and `PerpDexDetails` expose deployer configuration, sub-deployer grants, open-interest caps, and funding settings. Added `examples/hypercore/hip3-dex-details.rs`.
+- Rust SDK skill and reference material for coding agents.
+
+### Changed
+
+- All signing paths (`sign`, `sign_sync`, and `prehash`) share one exhaustive match over `Action`.
+- Live action audits verify the recovered signer as well as payload acceptance.
+- Unknown sub-deployer permission shapes are preserved instead of failing deserialization.
+
+### Fixed
+
+- L1 actions serialize addresses as lowercase hex strings before msgpack hashing, fixing signatures on subaccount, vault, validator, request-weight, and deployer actions.
+- `registerAsset` and `registerAsset2` serialize unset `maxGas` and `schema` as `null`, matching exchange signing bytes.
+- Price-tick calculations return `None` for invalid inputs and precision beyond `Decimal` capacity instead of panicking.
+
+## [v0.2.16] - 2026-09-23
+
+### Added
+
+- `PerpMarket::delisted` exposes the exchange's delisting flag.
+- `hypecli earn` commands and Trezor typed-data signing, including multisig Earn and Send operations and local address discovery using xpubs.
+- Optional `PredictedFundingVenue::funding_interval_hours`.
+
+### Changed
+
+- **Breaking**: `HttpClient::predicted_fundings` returns optional venue payloads. `None` represents a coin that is not listed on that venue.
+- **Breaking**: Both crates require Rust 1.94.1, matching the Alloy dependency requirement.
+- Unified CLI signer and multisig options across actions.
+- Updated SDK and CLI dependencies, including `base64` 0.23, `hex-literal` 1, and `iroh-mdns-address-lookup` 0.5.
+
+### Fixed
+
+- Multisig signing, Trezor EIP-712 domain handling, and Iroh TLS configuration.
+
+## [v0.2.15] - 2026-08-26
+
+### Added
+
+- HIP-1/HIP-2 spot, HIP-3 perpetual, and HIP-4 outcome deployer actions in `hypercore::types::deploy`, with corresponding HTTP client methods.
+- Exchange actions for EVM transfers with data, isolated-only margin top-ups, rewards, AQAv2 authorization, and validator L1 streams.
+- Single-order `modify`, plus `always_place` on single and batch modifications.
+- Exchange actions for borrowing and lending, subaccounts, vault management, referrals, validator and signer management, staking links, and portfolio margin.
+- Info requests `userDexAbstraction`, `outcomeTemplates`, and additional queries for exchange status, margin tables, recent trades, subaccounts, TWAP history, validators, vaults, routing, and borrowing interest.
+- WebSocket info and signed-action posts through `Connection::post` and `ConnectionHandle::post`, returning `Incoming::Post`. Added a WebSocket post example.
+- WebSocket subscriptions `assetCtxs`, `spotAssetCtxs`, and `userHistoricalOrders`, plus `Incoming::Error` for rejected subscriptions.
+- Live audits for info requests, exchange actions, deployer actions, and WebSocket subscriptions.
+- `hypecli` HIP-4 outcome commands: list, split, merge, merge-question, and negate.
+
+### Changed
+
+- **Breaking**: `BatchCancel` and `BatchCancelCloid` require a `fast` field, omitted from requests when false.
+- **Breaking**: `BatchModify` requires an `always_place` field, omitted when false.
+- **Breaking**: `HttpClient::reserve_request_weight` accepts `destination: Option<Address>`.
+- **Breaking**: Outcome deployment moved from `SpotDeployAction::Outcome` to `Action::OutcomeDeploy` and `HttpClient::outcome_deploy`.
+- `Response`, `OkResponse`, `OrderResponseStatus`, and `ActionRequest` derive `Clone`; response types also derive `Serialize`.
+- `OkResponse::CreateSubAccount` and `CreateVault` carry the newly assigned address.
+- Upgraded hypecli to Alloy 2.
+
+### Fixed
+
+- Market orders use `FrontendMarket` instead of GTC.
+- Fetch `deployerFeeScale` per asset.
+- Correct JSON mapping for `EvmUserModify` and log WebSocket close frames correctly.
+
+### Removed
+
+- **Breaking**: `HttpClient::aligned_quote_token_info` and `InfoRequest::AlignedQuoteTokenInfo`, which the exchange no longer accepts.
+- **Breaking**: `Subscription::WebData2` and `Incoming::WebData2`; use `webData3` for WebSocket data. The `webData2` info request remains available through `HttpClient::web_data2`.
+
+## [v0.2.14] - 2026-06-25
+
+### Added
+
+- HIP-4 `userOutcome` actions for splitting, merging, and negating outcome positions.
+- HTTP queries for asset contexts, funding, rate limits, deployer state, token details, settlement, portfolios, referrals, staking, and borrowing and lending.
+- TWAP order and cancel, withdrawals, USD class transfers, staking, delegation, request-weight reservation, and HIP-3 liquidator transfers.
+- Fast WebSocket asset-context and L2-book subscriptions.
+- Spot fee rates and additional account and market response fields.
+- Typed, downcastable API and signing errors using `thiserror` and `anyhow`.
+
+### Fixed
+
+- Side-dependent price rounding and reconnect backoff overflow.
+- Response field types, including asset-context premium, and compatibility with API fee fields.
+- Builder-address handling and CLI compatibility with SDK type changes.
+
+### Dependencies
+
+- Updated Alloy and upgraded hypecli to Iroh 1.0.
+
+## [v0.2.13] - 2026-05-30
+
+### Added
+
+- Builder fees on orders and a builder-fee approval query.
+- Typed `FillDirection` and optional token indices in `UserBalance`.
+- WebSocket `clearinghouseState`, `allDexsClearinghouseState`, `openOrders`, and `spotState` subscriptions.
+- `BasicOrder` trigger metadata: `is_trigger`, `trigger_px`, `trigger_condition`, and `is_position_tpsl`.
+- `OrderResponseStatus::WaitingForTrigger` and `WaitingForFill`.
+- `hypecli` VWAP support and a user-balances example.
+
+### Changed
+
+- WebSocket background tasks shut down when all handles and streams are dropped.
+- Renamed `perp_dexs` to `perp_dexes`, retaining deprecated aliases.
+- Added identity-based equality and hashing to market types.
+
+### Fixed
+
+- Spot tokens are matched by their index field instead of array position.
+- Market-open price handling and the user-abstraction info request.
+- HTTP error handling for non-UTF-8 response bodies and request labels.
+
+### Removed
+
+- Deprecated Uniswap `get_pool_addres` method.
+
+## [v0.2.11] - 2026-04-30
+
+### Added
+
+- `HttpClient::market_open` for native market orders.
+
+### Fixed
+
+- Outcome-market asset IDs include the full outcome offset.
+- Restored `n_sig_figs` and `mantissa` on L2-book subscriptions after a temporary removal.
+
+### Changed
+
+- Consolidated `AbstractionMode` into `types/api.rs`.
+- Expanded SDK, CLI, and example documentation.
 
 ## [v0.2.10]
 
@@ -111,7 +273,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- `HttpClient::user_fills_by_time()` — query fills within a time range
+- `HttpClient::user_fills_by_time()` to query fills within a time range
 - Advanced WebSocket user stream subscriptions: `UserEvents`, `UserFills`, `UserTwapSliceFills`,
   `UserTwapHistory`, `ActiveAssetCtx`, `WebData2`
 - Tolerate missing TWAP history descriptions gracefully

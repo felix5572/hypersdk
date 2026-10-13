@@ -7,7 +7,7 @@
 //! - Solidity struct definitions for EIP-712 signing
 
 use alloy::{
-    dyn_abi::{Eip712Types, Resolver, TypedData},
+    dyn_abi::{Eip712Types, PropertyDef, Resolver, TypedData},
     primitives::{Address, B256, U256, keccak256},
     sol_types::SolStruct,
 };
@@ -17,6 +17,42 @@ use super::Cloid;
 use crate::hypercore::Chain;
 
 const HYPERLIQUID_EIP_PREFIX: &str = "HyperliquidTransaction:";
+
+pub(super) fn serialize_agent_name<S: Serializer>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(value.as_deref().unwrap_or_default())
+}
+
+/// Enrich the ordinary user-signed schema, preserving its field order.
+pub(super) fn multisig_typed_data(
+    mut data: TypedData,
+    multi_sig_user: Address,
+    lead: Address,
+) -> TypedData {
+    let mut types = Eip712Types::from(&data.resolver);
+    let fields = types
+        .get_mut(&data.primary_type)
+        .expect("known action schema");
+    let index = fields
+        .iter()
+        .position(|field| field.name() == "hyperliquidChain")
+        .expect("user-signed actions include hyperliquidChain")
+        + 1;
+    fields.splice(
+        index..index,
+        [
+            PropertyDef::new_unchecked("address", "payloadMultiSigUser"),
+            PropertyDef::new_unchecked("address", "outerSigner"),
+        ],
+    );
+    data.resolver = Resolver::from(types);
+    data.message["payloadMultiSigUser"] =
+        const_hex::encode_prefixed(multi_sig_user.as_slice()).into();
+    data.message["outerSigner"] = const_hex::encode_prefixed(lead.as_slice()).into();
+    data
+}
 
 /// Serde module for normalized decimal serialization.
 ///
@@ -48,6 +84,32 @@ pub(super) mod decimal_normalized {
         Decimal::from_str(&s)
             .map(|d| d.normalize())
             .map_err(de::Error::custom)
+    }
+}
+
+/// [`decimal_normalized`] for an optional decimal. `None` serializes as `null`.
+pub(super) mod decimal_normalized_option {
+    use rust_decimal::Decimal;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<Decimal>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => super::decimal_normalized::serialize(value, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Normalized(#[serde(with = "super::decimal_normalized")] Decimal);
+
+        Ok(Option::<Normalized>::deserialize(deserializer)?.map(|Normalized(d)| d))
     }
 }
 
@@ -152,6 +214,52 @@ where
     S: Serializer,
 {
     serializer.serialize_str(&format!("{:#x}", value))
+}
+
+/// Serializes an optional address as a lowercase hex string, or `null` when absent.
+pub(super) fn serialize_option_address_as_hex<S>(
+    value: &Option<Address>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(address) => serialize_address_as_hex(address, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Serializes `(address, value)` pairs with each address as a lowercase hex string.
+pub(super) fn serialize_address_pairs_as_hex<S, T>(
+    pairs: &[(Address, T)],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Serialize,
+{
+    serializer.collect_seq(
+        pairs
+            .iter()
+            .map(|(address, value)| (format!("{address:#x}"), value)),
+    )
+}
+
+/// [`serialize_address_pairs_as_hex`] for an optional list. Pair it with
+/// `skip_serializing_if = "Option::is_none"`.
+pub(super) fn serialize_option_address_pairs_as_hex<S, T>(
+    pairs: &Option<Vec<(Address, T)>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Serialize,
+{
+    match pairs {
+        Some(pairs) => serialize_address_pairs_as_hex(pairs, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Deserializes an address from a hex string.

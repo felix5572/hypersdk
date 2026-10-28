@@ -1976,6 +1976,9 @@ pub enum OrderStatus {
     PerpMaxPositionRejected,
     /// Would exceed the open order limit
     TooManyOpenOrdersRejected,
+    /// Reduce-only ALO order rejected by the ALO priority path (seen on mainnet node order statuses 2026-10-28; not
+    /// yet in HL's docs, whose priority fees apply only to ALO orders that are not reduce-only)
+    PriorityAloReduceOnlyRejected,
 }
 
 impl OrderStatus {
@@ -2072,6 +2075,7 @@ impl OrderStatus {
                 | OrderStatus::OracleRejected
                 | OrderStatus::PerpMaxPositionRejected
                 | OrderStatus::TooManyOpenOrdersRejected
+                | OrderStatus::PriorityAloReduceOnlyRejected
         )
     }
 }
@@ -4616,6 +4620,14 @@ pub(super) enum InfoRequest {
 mod tests {
     use super::*;
     use crate::hypercore::types::api::Response;
+
+    #[test]
+    fn priority_alo_reduce_only_rejected_is_a_rejection() {
+        // the node's order status of 2026-10-28 14:41:59 (block 1200443963, xyz:HOOD reduce-only Alo sell)
+        let status: OrderStatus = serde_json::from_str("\"priorityAloReduceOnlyRejected\"").unwrap();
+        assert!(matches!(status, OrderStatus::PriorityAloReduceOnlyRejected));
+        assert!(status.is_rejected() && status.is_finished() && !status.is_cancelled());
+    }
 
     #[test]
     fn test_api_error_response() {

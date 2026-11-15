@@ -1979,6 +1979,10 @@ pub enum OrderStatus {
     /// Reduce-only ALO order rejected by the ALO priority path (seen on mainnet node order statuses 2026-10-28; not
     /// yet in HL's docs, whose priority fees apply only to ALO orders that are not reduce-only)
     PriorityAloReduceOnlyRejected,
+    /// A resting order cancelled by the exchange, the user's spot balance (counted in the token's wei) no longer
+    /// covering it (seen on mainnet node order statuses from 2026-11-12, almost all resting spot Alo orders, each
+    /// `open` a few blocks earlier; not yet in HL's docs)
+    InsufficientWeiCanceled,
 }
 
 impl OrderStatus {
@@ -2041,6 +2045,7 @@ impl OrderStatus {
                 | OrderStatus::ScheduledCancel
                 | OrderStatus::InternalCancel
                 | OrderStatus::IocCancelRejected
+                | OrderStatus::InsufficientWeiCanceled
         )
     }
 
@@ -4620,6 +4625,14 @@ pub(super) enum InfoRequest {
 mod tests {
     use super::*;
     use crate::hypercore::types::api::Response;
+
+    #[test]
+    fn insufficient_wei_canceled_is_a_cancellation() {
+        // the node's order status of 2026-11-15 02:01:03.682 (block 1221647900, @156 Alo sell `open` at block 1221647892)
+        let status: OrderStatus = serde_json::from_str("\"insufficientWeiCanceled\"").unwrap();
+        assert!(matches!(status, OrderStatus::InsufficientWeiCanceled));
+        assert!(status.is_cancelled() && status.is_finished() && !status.is_rejected() && !status.is_filled());
+    }
 
     #[test]
     fn priority_alo_reduce_only_rejected_is_a_rejection() {
